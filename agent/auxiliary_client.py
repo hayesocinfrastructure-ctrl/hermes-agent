@@ -163,6 +163,33 @@ _CODEX_AUX_MODEL = "gpt-5.2-codex"
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
+def _codex_default_headers(token: str) -> dict:
+    """Build the headers required by the Codex backend.
+
+    chatgpt.com/backend-api requires both chatgpt-account-id (extracted from
+    the JWT) and an originator header, in addition to the Bearer token.
+    Without these the backend can return 401 auth parsing errors.
+    """
+    import base64
+    import json as _json
+    import platform
+
+    try:
+        parts = token.split(".")
+        payload = _json.loads(base64.b64decode(parts[1] + "==").decode())
+        account_id = payload["https://api.openai.com/auth"]["chatgpt_account_id"]
+    except Exception:
+        account_id = ""
+
+    ua = f"codex_cli_rs/0.0.0 ({platform.system()} {platform.release()}; {platform.machine()})"
+    return {
+        "chatgpt-account-id": account_id,
+        "originator": "codex_cli_rs",
+        "User-Agent": ua,
+        "OpenAI-Beta": "responses=experimental",
+    }
+
+
 def _to_openai_base_url(base_url: str) -> str:
     """Normalize an Anthropic-style base URL to OpenAI-compatible format.
 
@@ -1015,7 +1042,11 @@ def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
             return None, None
         base_url = _CODEX_AUX_BASE_URL
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", _CODEX_AUX_MODEL)
-    real_client = OpenAI(api_key=codex_token, base_url=base_url)
+    real_client = OpenAI(
+        api_key=codex_token,
+        base_url=base_url,
+        default_headers=_codex_default_headers(codex_token),
+    )
     return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
 
 
@@ -1475,7 +1506,11 @@ def resolve_provider_client(
                                "but no Codex OAuth token found (run: hermes model)")
                 return None, None
             final_model = _normalize_resolved_model(model or _CODEX_AUX_MODEL, provider)
-            raw_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
+            raw_client = OpenAI(
+                api_key=codex_token,
+                base_url=_CODEX_AUX_BASE_URL,
+                default_headers=_codex_default_headers(codex_token),
+            )
             return (raw_client, final_model)
         # Standard path: wrap in CodexAuxiliaryClient adapter
         client, default = _try_codex()
@@ -1516,9 +1551,30 @@ def resolve_provider_client(
             client = _wrap_if_needed(client, final_model, custom_base)
             return (_to_async_client(client, final_model) if async_mode
                     else (client, final_model))
-        # Try custom first, then codex, then API-key providers
-        for try_fn in (_try_custom_endpoint, _try_codex,
-                       _resolve_api_key_provider):
+        # Respect OPENAI_BASE_URL directly when it points at a non-Codex
+        # OpenAI-compatible endpoint. This avoids accidentally falling through
+        # to the Codex backend when the primary/fallback runtime is meant to
+        # use a normal OpenAI-compatible server.
+        _env_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+        if _env_base and "chatgpt.com" not in _env_base.lower():
+            _env_key = os.getenv("OPENAI_API_KEY", "").strip() or "no-key-required"
+            final_model = _normalize_resolved_model(
+                model or _read_main_model() or "gpt-4o-mini",
+                provider,
+            )
+            client = OpenAI(api_key=_env_key, base_url=_env_base)
+            logger.debug(
+                "resolve_provider_client: custom via OPENAI_BASE_URL (%s)",
+                _env_base,
+            )
+            client = _wrap_if_needed(client, final_model, _env_base)
+            return (_to_async_client(client, final_model) if async_mode
+                    else (client, final_model))
+
+        # Try custom endpoint resolver, then API-key providers.
+        # Do not fall through to _try_codex here, or custom/main fallback can
+        # bleed into the Codex backend unexpectedly.
+        for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
             client, default = try_fn()
             if client is not None:
                 final_model = _normalize_resolved_model(model or default, provider)
