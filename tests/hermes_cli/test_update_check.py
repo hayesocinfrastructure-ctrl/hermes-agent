@@ -17,7 +17,7 @@ def test_version_string_no_v_prefix():
 
 
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
-    """When cache is fresh, check_for_updates should return cached value without calling git."""
+    """When cache is fresh and refs match, check_for_updates should return cached value without calling git."""
     from hermes_cli.banner import check_for_updates
 
     # Create a fake git repo and fresh cache
@@ -26,10 +26,18 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     (repo_dir / ".git").mkdir()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3}))
+    cache_file.write_text(json.dumps({
+        "ts": time.time(),
+        "behind": 3,
+        "head": "abc12345",
+        "upstream": "def67890",
+    }))
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+    with (
+        patch("hermes_cli.banner._git_short_hash", side_effect=["abc12345", "def67890"]),
+        patch("hermes_cli.banner.subprocess.run") as mock_run,
+    ):
         result = check_for_updates()
 
     assert result == 3
@@ -51,10 +59,41 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
     mock_result = MagicMock(returncode=0, stdout="5\n")
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
+    with (
+        patch("hermes_cli.banner._git_short_hash", side_effect=["head1234", "upstream9"]),
+        patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run,
+    ):
         result = check_for_updates()
 
     assert result == 5
+    assert mock_run.call_count == 2  # git fetch + git rev-list
+
+
+def test_check_for_updates_ignores_fresh_cache_when_git_state_changes(tmp_path, monkeypatch):
+    """Fresh cache must be invalidated when HEAD/upstream refs changed since it was written."""
+    from hermes_cli.banner import check_for_updates
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(json.dumps({
+        "ts": time.time(),
+        "behind": 13,
+        "head": "oldhead12",
+        "upstream": "oldup123",
+    }))
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with (
+        patch("hermes_cli.banner._git_short_hash", side_effect=["newhead34", "newup567", "newhead34", "newup567"]),
+        patch("hermes_cli.banner.subprocess.run", return_value=MagicMock(returncode=0, stdout="0\n")) as mock_run,
+    ):
+        result = check_for_updates()
+
+    assert result == 0
     assert mock_run.call_count == 2  # git fetch + git rev-list
 
 

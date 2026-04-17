@@ -129,6 +129,10 @@ def check_for_updates() -> Optional[int]:
     Does a ``git fetch`` at most once every 6 hours (cached to
     ``~/.hermes/.update_check``).  Returns the number of commits behind,
     or ``None`` if the check fails or isn't applicable.
+
+    Fresh cache entries are only reused when they match the current local
+    ``HEAD`` and ``origin/main`` refs. This prevents stale "commits behind"
+    reports after manual git updates or branch switches.
     """
     hermes_home = get_hermes_home()
     repo_dir = hermes_home / "hermes-agent"
@@ -140,13 +144,23 @@ def check_for_updates() -> Optional[int]:
     if not (repo_dir / ".git").exists():
         return None
 
+    def _current_refs() -> tuple[Optional[str], Optional[str]]:
+        return (_git_short_hash(repo_dir, "HEAD"), _git_short_hash(repo_dir, "origin/main"))
+
     # Read cache
     now = time.time()
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text())
             if now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS:
-                return cached.get("behind")
+                current_head, current_upstream = _current_refs()
+                if (
+                    current_head
+                    and current_upstream
+                    and cached.get("head") == current_head
+                    and cached.get("upstream") == current_upstream
+                ):
+                    return cached.get("behind")
     except Exception:
         pass
 
@@ -174,9 +188,16 @@ def check_for_updates() -> Optional[int]:
     except Exception:
         behind = None
 
+    current_head, current_upstream = _current_refs()
+
     # Write cache
     try:
-        cache_file.write_text(json.dumps({"ts": now, "behind": behind}))
+        cache_file.write_text(json.dumps({
+            "ts": now,
+            "behind": behind,
+            "head": current_head,
+            "upstream": current_upstream,
+        }))
     except Exception:
         pass
 
