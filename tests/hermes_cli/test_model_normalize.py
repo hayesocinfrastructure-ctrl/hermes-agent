@@ -51,6 +51,14 @@ class TestAnthropicDotToHyphen:
         result = normalize_model_for_provider("anthropic/claude-sonnet-4.6", "anthropic")
         assert result == "claude-sonnet-4-6"
 
+    @pytest.mark.parametrize("model", [
+        "claude-sonnet-4",
+        "anthropic/claude-sonnet-4",
+    ])
+    def test_anthropic_repairs_common_shorthand_alias(self, model):
+        """Common shorthand should resolve to Anthropic's currently supported Sonnet 4 id."""
+        assert normalize_model_for_provider(model, "anthropic") == "claude-sonnet-4-6"
+
 
 # ── OpenCode Zen regression ────────────────────────────────────────────
 

@@ -178,6 +178,20 @@ def _dots_to_hyphens(model_name: str) -> str:
     return model_name.replace(".", "-")
 
 
+_ANTHROPIC_SHORTHAND_ALIASES: dict[str, str] = {
+    # Common marketing shorthand users type into config/CLI.
+    # Anthropic's direct API rejects these unless they resolve to the
+    # current native model id.
+    "claude-sonnet-4": "claude-sonnet-4-6",
+    "claude-opus-4": "claude-opus-4-7",
+}
+
+
+def _repair_anthropic_shorthand(model_name: str) -> str:
+    """Map common Anthropic shorthand ids to supported native API ids."""
+    return _ANTHROPIC_SHORTHAND_ALIASES.get(model_name, model_name)
+
+
 def _normalize_provider_alias(provider_name: str) -> str:
     """Resolve provider aliases to Hermes' canonical ids."""
     raw = (provider_name or "").strip().lower()
@@ -367,11 +381,13 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
             return _dots_to_hyphens(bare)
         return bare
 
-    # --- Anthropic: strip matching provider prefix, dots -> hyphens ---
+    # --- Anthropic: strip matching provider prefix, repair common Claude
+    #     shorthands, then dots -> hyphens ---
     if provider in _DOT_TO_HYPHEN_PROVIDERS:
         bare = _strip_matching_provider_prefix(name, provider)
         if "/" in bare:
             return bare
+        bare = _repair_anthropic_shorthand(bare)
         return _dots_to_hyphens(bare)
 
     # --- Copilot / Copilot ACP: delegate to the Copilot-specific
