@@ -16,6 +16,7 @@ import logging
 import os
 import html as _html
 import re
+import tempfile
 import threading
 import time
 from contextvars import ContextVar
@@ -6749,6 +6750,53 @@ class TelegramAdapter(BasePlatformAdapter):
             return True, None
         return False, self._telegram_media_too_large_note(label, size, max_bytes)
 
+    def _convert_audio_to_telegram_voice_note(self, audio_path: str) -> Optional[str]:
+        """Convert MP3/M4A audio into an OGG/Opus Telegram voice note when possible."""
+        try:
+            import av
+            from av.audio.frame import AudioFrame
+            from av.audio.resampler import AudioResampler
+        except Exception as exc:
+            logger.info("[%s] PyAV unavailable for Telegram voice-note conversion: %s", self.name, exc)
+            return None
+
+        temp_fd, temp_path = tempfile.mkstemp(prefix="hermes-telegram-voice-", suffix=".ogg")
+        os.close(temp_fd)
+        try:
+            with av.open(audio_path) as input_container, av.open(temp_path, mode="w", format="ogg") as output_container:
+                input_stream = next((stream for stream in input_container.streams if stream.type == "audio"), None)
+                if input_stream is None:
+                    raise ValueError("No audio stream found")
+
+                output_stream = output_container.add_stream("libopus", rate=48000)
+                output_stream.layout = "mono"
+                resampler = AudioResampler(format="fltp", layout="mono", rate=48000)
+
+                for frame in input_container.decode(input_stream):
+                    if not isinstance(frame, AudioFrame):
+                        continue
+                    resampled = resampler.resample(frame)
+                    if resampled is None:
+                        continue
+                    frames = resampled if isinstance(resampled, list) else [resampled]
+                    for normalized in frames:
+                        for packet in output_stream.encode(normalized):
+                            output_container.mux(packet)
+
+                for packet in output_stream.encode(None):
+                    output_container.mux(packet)
+
+            if os.path.getsize(temp_path) <= 0:
+                raise ValueError("Converted Telegram voice note is empty")
+            return temp_path
+        except Exception as exc:
+            logger.warning("[%s] Failed to convert %s into Telegram voice note: %s", self.name, audio_path, exc)
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            return None
+
     async def send_voice(
         self,
         chat_id: str,
@@ -6761,15 +6809,24 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        converted_voice_path: Optional[str] = None
         try:
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
-            
+
+            ext = os.path.splitext(audio_path)[1].lower()
+            send_path = audio_path
+            if ext in {".mp3", ".m4a"}:
+                converted_voice_path = self._convert_audio_to_telegram_voice_note(audio_path)
+                if converted_voice_path:
+                    send_path = converted_voice_path
+                    ext = ".ogg"
+
             # Compute duration locally — Telegram drops it for long clips
             # (~5 min+), which then show 0:00 in the player.
             _duration_secs = await asyncio.to_thread(
-                _probe_voice_duration_seconds, audio_path
+                _probe_voice_duration_seconds, send_path
             )
 
             # Render caption markdown (#32029): auto-TTS captions carry the
@@ -6795,8 +6852,7 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 _caption_variants.append((None, None))
 
-            with open(audio_path, "rb") as audio_file:
-                ext = os.path.splitext(audio_path)[1].lower()
+            with open(send_path, "rb") as audio_file:
                 # .ogg / .opus files -> send as voice (round playable bubble)
                 if ext in {".ogg", ".opus"}:
                     _voice_thread = self._metadata_thread_id(metadata)
@@ -6853,7 +6909,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "Telegram send_voice failed for all caption variants"
                         )
                 elif ext in {".mp3", ".m4a"}:
-                    # Telegram's Bot API sendAudio only accepts MP3 / M4A.
+                    # Fallback path when voice-note conversion is unavailable.
                     _audio_thread = self._metadata_thread_id(metadata)
                     reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
                     audio_thread_kwargs = self._thread_kwargs_for_send(
@@ -6899,6 +6955,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
+        finally:
+            if converted_voice_path and converted_voice_path != audio_path:
+                try:
+                    os.unlink(converted_voice_path)
+                except OSError:
+                    pass
 
     async def send_multiple_images(
         self,
